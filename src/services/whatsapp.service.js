@@ -11,7 +11,7 @@ import fs from "fs";
 import pino from "pino";
 import { Boom } from "@hapi/boom";
 import logger from "./logger.service.js";
-import { WHATSAPP_CONFIG, TRIGGER_N8N_URL } from "../config/constants.js";
+import { WHATSAPP_CONFIG, TRIGGER_N8N_URL, TRIGGER_N8N_OUTGOING_URL } from "../config/constants.js";
 
 // Cache de la version de Baileys: evita pedirla por red en cada initialize()
 let cachedBaileysVersion = null;
@@ -87,7 +87,7 @@ class WhatsAppService {
     }
   }
 
-  // NUEVO WEB HOOK PARA ENVIO A N8N
+  // NUEVO WEB HOOK PARA ENVIO A N8N - MENSAJES ENTRANTES
 
   async sendToN8n(messageData) {
     const url = TRIGGER_N8N_URL;
@@ -130,6 +130,51 @@ class WhatsAppService {
         );
       }
     } catch (error) {}
+  }
+
+  // NUEVO WEB HOOK PARA ENVIO A N8N - MENSAJES SALIENTES
+  async sendToN8nOutgoing(messageData) {
+    const url = TRIGGER_N8N_OUTGOING_URL;
+
+    if (!url) {
+      logger.warn("TRIGGER_N8N_OUTGOING_URL no está configurado");
+      return;
+    }
+
+    try {
+      const payload = {
+        event: "whatsapp_outgoing_message",
+        phone: messageData.phone || null,
+        jid: messageData.jid,
+        message: messageData.text,
+        messageId: messageData.messageId,
+        timestamp: messageData.timestamp,
+        mediaType: messageData.mediaType || "text",
+        hasMedia: messageData.hasMedia || false,
+        status: messageData.status || "sent",
+      };
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`n8n outgoing respondió ${response.status}: ${errorText}`);
+      }
+
+      logger.info("Mensaje saliente enviado a n8n", { messageId: messageData.messageId });
+    } catch (error) {
+      logger.error("Error al enviar mensaje saliente a n8n", {
+        error: error.message,
+        messageId: messageData.messageId,
+      });
+    }
   }
 
   /**
@@ -749,6 +794,18 @@ class WhatsAppService {
         ptt: true,
       });
 
+      // Enviar a n8n (mensaje saliente)
+      await this.sendToN8nOutgoing({
+        jid,
+        phone: this.isLid(jid) ? null : this.extractJidBase(jid),
+        text: "",
+        messageId: result.key.id,
+        timestamp: result.messageTimestamp,
+        mediaType: "audio",
+        hasMedia: true,
+        status: "sent",
+      });
+
       logger.info("Audio enviado", { jid });
       return {
         success: true,
@@ -775,6 +832,18 @@ class WhatsAppService {
         video: videoBuffer,
         caption: caption || undefined,
         mimetype,
+      });
+
+      // Enviar a n8n (mensaje saliente)
+      await this.sendToN8nOutgoing({
+        jid,
+        phone: this.isLid(jid) ? null : this.extractJidBase(jid),
+        text: caption,
+        messageId: result.key.id,
+        timestamp: result.messageTimestamp,
+        mediaType: "video",
+        hasMedia: true,
+        status: "sent",
       });
 
       logger.info("Video enviado", { jid });
@@ -902,6 +971,18 @@ class WhatsAppService {
         });
       }
 
+      // Enviar a n8n (mensaje saliente)
+      await this.sendToN8nOutgoing({
+        jid,
+        phone: this.isLid(jid) ? null : this.extractJidBase(jid),
+        text,
+        messageId: result.key.id,
+        timestamp: result.messageTimestamp,
+        mediaType: "text",
+        hasMedia: false,
+        status: "sent",
+      });
+
       const isLidJid = this.isLid(jid);
       logger.info("Mensaje de texto enviado", {
         jid,
@@ -954,6 +1035,19 @@ class WhatsAppService {
       }
 
       const result = await this.sock.sendMessage(jid, message);
+
+      // Enviar a n8n (mensaje saliente)
+      await this.sendToN8nOutgoing({
+        jid,
+        phone: this.isLid(jid) ? null : this.extractJidBase(jid),
+        text: caption,
+        messageId: result.key.id,
+        timestamp: result.messageTimestamp,
+        mediaType: isGif ? "gif" : "image",
+        hasMedia: true,
+        status: "sent",
+      });
+
       logger.info("Mensaje enviado con éxito", { jid, isGif });
       return {
         success: true,

@@ -33,6 +33,8 @@ export const RATE_LIMIT_CONFIG = {
   },
 };
 
+
+
 // Configuracion de WhatsApp
 export const WHATSAPP_CONFIG = {
   authPath: "./auth_info",

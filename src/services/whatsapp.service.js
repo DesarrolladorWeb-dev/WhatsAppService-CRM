@@ -543,6 +543,9 @@ class WhatsAppService {
       // Ignorar mensajes propios
       if (msg.key.fromMe) continue;
 
+      // Ignorar estados de WhatsApp
+      if (msg.key.remoteJid === "status@broadcast") continue;
+
       // Ignorar mensajes de grupos
       if (msg.key.remoteJid.includes("@g.us")) continue;
 

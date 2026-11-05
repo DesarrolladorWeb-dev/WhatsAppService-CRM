@@ -3,15 +3,9 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 import { Server } from "socket.io";
-import {
-  ALLOWED_ORIGINS,
-  MAX_SOCKET_CONNECTIONS,
-  PORT,
-} from "./src/config/constants.js";
-import {
-  generalLimiter,
-  sendImageLimiter,
-} from "./src/middleware/rateLimiter.js";
+import { ALLOWED_ORIGINS, MAX_SOCKET_CONNECTIONS, PORT } from "./src/config/constants.js";
+import { generalLimiter, sendImageLimiter, authLimiter } from "./src/middleware/rateLimiter.js";
+import { requireServiceSecret, verifySocketToken } from "./src/middleware/serviceAuth.js";
 import * as whatsappController from "./src/controllers/whatsapp.controller.js";
 import whatsappService from "./src/services/whatsapp.service.js";
 import logger from "./src/services/logger.service.js";
@@ -31,11 +25,19 @@ app.set("trust proxy", 1);
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json({ limit: "10mb" }));
 
+io.use((socket, next) =>
+  verifySocketToken(socket.handshake.auth?.token)
+    ? next()
+    : next(new Error("unauthorized"))
+);
+
 /********************* ENDPOINTS *********************/
 
 app.get("/", (req, res) => {
   res.send("Servicio de WhatsApp funcionando");
 });
+
+app.use("/api/whatsapp", authLimiter, requireServiceSecret); 
 
 // para ver el estado de la conexion y el QR
 app.get("/api/whatsapp/status", whatsappController.getStatus);

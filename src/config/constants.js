@@ -15,29 +15,21 @@ export const TRIGGER_N8N_OUTGOING_URL = process.env.TRIGGER_N8N_OUTGOING_URL;
 
 // Configuracion de rate limiting
 export const RATE_LIMIT_CONFIG = {
-  auth: {
-    windowMs: 15 * 60 * 1000,
-    max: 30,
-    message: {
-      success: false,
-      message: "Demasiados intentos, intenta más tarde",
-    },
-  },
   general: {
-    windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 30, // 30 peticiones por 15 minutos
+    windowMs: 1 * 60 * 1000, // 1 minuto
+    max: 60, // 60 peticiones por minuto
     message: {
       success: false,
       message: "Demasiadas peticiones, intenta más tarde",
     },
   },
   sendMessage: {
-    windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 20, // 20 peticiones por 15 minutos
+    windowMs: 1 * 60 * 1000,
+    max: 20,
   },
   sendImage: {
-    windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 30, // 30 peticiones por 15 minutos
+    windowMs: 1 * 60 * 1000,
+    max: 60,
   },
 };
 

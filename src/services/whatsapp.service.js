@@ -122,20 +122,14 @@ class WhatsAppService {
         signal: AbortSignal.timeout(10000),
       });
 
-      const responseText = await response.text().catch(() => '');
+      const responseText = await response.text();
 
       if (!response.ok) {
         throw new Error(
-          `n8n respondió ${response.status}: ${responseText.slice(0, 500)}`,
+          `n8n respondió ${response.status}: ${await response.text()}`,
         );
       }
-
-      logger.info("n8n.incoming_forwarded", {
-        messageId: messageData.messageId,
-      });
-    } catch (error) {
-      logger.error("n8n.incoming_forward_failed", { error: error.message, messageId: messageData.messageId });
-    }
+    } catch (error) {}
   }
 
   // NUEVO WEB HOOK PARA ENVIO A N8N - MENSAJES SALIENTES

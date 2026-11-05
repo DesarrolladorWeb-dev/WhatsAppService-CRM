@@ -9,15 +9,6 @@ export const generalLimiter = rateLimit({
     legacyHeaders: false
 });
 
-export const authLimiter = rateLimit({
-    windowMs: RATE_LIMIT_CONFIG.auth.windowMs,
-    max: RATE_LIMIT_CONFIG.auth.max,
-    message: RATE_LIMIT_CONFIG.auth.message,
-    skipSuccessfulRequests: true,
-    standardHeaders: true,
-    legacyHeaders: false
-});
-
 export const sendMessageLimiter = rateLimit({
     windowMs: RATE_LIMIT_CONFIG.sendMessage.windowMs,
     max: RATE_LIMIT_CONFIG.sendMessage.max,

@@ -1,5 +1,10 @@
 import whatsappService from "../services/whatsapp.service.js";
 import logger from "../services/logger.service.js";
+import https from "node:https";
+import dns from "node:dns";
+import net from "node:net";
+import ipaddr from "ipaddr.js";
+import { fileTypeFromBuffer } from "file-type";
 
 // NO importar mysql aquí arriba
 let pool = null;
@@ -101,48 +106,169 @@ export async function resetSession(req, res) {
   }
 }
 
-/**
- * Procesa una fuente de media (URL o Base64) y devuelve un Buffer y el Mimetype detectado
- * Soporta: imágenes, audios, videos, documentos
- */
+// Límites por archivo. express.json limita el cuerpo HTTP entrante;
+// estos controles también protegen las descargas remotas y la decodificación.
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const MEDIA_TIMEOUT_MS = 15_000;
+const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_MEDIA_BYTES / 3);
+const ALLOWED_MEDIA_TYPES = new Set([
+  // Imágenes
+  "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif",
+  "image/bmp", "image/tiff", "image/x-icon", "image/vnd.microsoft.icon",
+  "image/heic", "image/heif",
+  // Audio
+  "audio/mpeg", "audio/ogg", "audio/opus", "audio/wav", "audio/x-wav",
+  "audio/flac", "audio/mp4", "audio/aac", "audio/x-aac", "audio/midi",
+  "audio/x-midi", "audio/webm", "audio/3gpp", "audio/amr",
+  "audio/x-m4a", "audio/ogg; codecs=opus",
+  // Video
+  "video/mp4", "video/webm", "video/3gpp", "video/quicktime",
+  "video/x-msvideo", "video/x-matroska", "video/mpeg",
+  // Documento permitido
+  "application/pdf",
+]);
+
+class MediaError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = "MediaError";
+    this.status = status;
+  }
+}
+
+function isPublicIp(address) {
+  try {
+    return ipaddr.process(address).range() === "unicast";
+  } catch {
+    return false;
+  }
+}
+
+// Valida todas las respuestas DNS y conecta usando una de esas mismas IP.
+function safeLookup(hostname, options, callback) {
+  dns.lookup(hostname, { all: true }, (error, addresses) => {
+    if (error) return callback(error);
+    if (!addresses.length || addresses.some(({ address }) => !isPublicIp(address))) {
+      return callback(new MediaError("Destino de descarga no permitido"));
+    }
+    const family = typeof options === "number" ? options : options.family;
+    const candidates = family
+      ? addresses.filter((entry) => entry.family === family)
+      : addresses;
+    if (!candidates.length) return callback(new MediaError("IP no disponible"));
+    if (options.all) return callback(null, candidates);
+    callback(null, candidates[0].address, candidates[0].family);
+  });
+}
+
+async function downloadMedia(source) {
+  let url;
+  try {
+    url = new URL(source);
+  } catch {
+    throw new MediaError("URL inválida");
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  if (
+    url.protocol !== "https:" || url.username || url.password ||
+    (net.isIP(hostname) && !isPublicIp(hostname))
+  ) throw new MediaError("URL de descarga no permitida");
+
+  const signal = AbortSignal.timeout(MEDIA_TIMEOUT_MS);
+  let response;
+  try {
+    response = await new Promise((resolve, reject) => {
+      https.get(url, {
+        agent: false,
+        lookup: safeLookup,
+        signal,
+        rejectUnauthorized: true,
+        maxHeaderSize: 16 * 1024,
+        headers: { "Accept-Encoding": "identity" },
+      }, resolve).on("error", reject);
+    });
+    // https.get no sigue redirecciones; se aceptan solamente respuestas 2xx.
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new MediaError("Descarga fallida o redirección no permitida");
+    }
+    const encoding = response.headers["content-encoding"];
+    if (encoding && encoding.toLowerCase() !== "identity") {
+      throw new MediaError("Respuesta HTTP comprimida no permitida");
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response) {
+      size += chunk.length;
+      if (size > MAX_MEDIA_BYTES) {
+        throw new MediaError("El archivo supera los 10 MB", 413);
+      }
+      chunks.push(chunk);
+    }
+    if (!response.complete || !size) {
+      throw new MediaError("Archivo vacío o descarga incompleta");
+    }
+    return Buffer.concat(chunks, size);
+  } catch (error) {
+    if (error instanceof MediaError) throw error;
+    throw new MediaError(signal.aborted
+      ? "La descarga superó los 15 segundos"
+      : "No se pudo descargar el archivo");
+  } finally {
+    response?.destroy();
+  }
+}
+
+function decodeMediaBase64(source) {
+  let base64 = source;
+  if (/^data:/i.test(source)) {
+    const comma = source.indexOf(",");
+    if (comma === -1) throw new MediaError("URL de datos inválida");
+    base64 = source.slice(comma + 1);
+  }
+  if (base64.length > MAX_BASE64_LENGTH || Buffer.byteLength(base64, "base64") > MAX_MEDIA_BYTES) {
+    throw new MediaError("El archivo supera los 10 MB", 413);
+  }
+  const buffer = Buffer.from(base64, "base64");
+  if (!buffer.length) {
+    throw new MediaError("Archivo vacío");
+  }
+  return buffer;
+}
+
+/** Procesa HTTPS o Base64 limitado y devuelve el MIME detectado por los bytes. */
 async function processMedia(mediaSource) {
-  if (!mediaSource) return { buffer: null, mimetype: null };
-
-  let mediaBuffer;
-  let detectedMimetype = null;
-
-  if (mediaSource.startsWith("http://") || mediaSource.startsWith("https://")) {
-    try {
-      const response = await fetch(mediaSource);
-      if (!response.ok) throw new Error("No se pudo descargar el archivo");
-      detectedMimetype = response.headers.get("content-type") || null;
-      mediaBuffer = Buffer.from(await response.arrayBuffer());
-    } catch (error) {
-      logger.error("Error al descargar archivo desde URL", {
-        error: error.message,
-        url: mediaSource,
-      });
-      return { buffer: null, mimetype: null };
-    }
-  } else if (mediaSource.startsWith("data:")) {
-    const parts = mediaSource.split(",");
-    if (parts.length === 2) {
-      const mimeMatch = parts[0].match(/data:([^;]+);/);
-      detectedMimetype = mimeMatch ? mimeMatch[1] : null;
-      mediaBuffer = Buffer.from(parts[1], "base64");
-    }
-  } else {
-    mediaBuffer = Buffer.from(mediaSource, "base64");
+  if (mediaSource == null || mediaSource === "") {
+    return { buffer: null, mimetype: null };
+  }
+  if (typeof mediaSource !== "string") {
+    throw new MediaError("La fuente de media debe ser una cadena");
   }
 
-  return { buffer: mediaBuffer, mimetype: detectedMimetype };
+  const buffer = /^https?:\/\//i.test(mediaSource)
+    ? await downloadMedia(mediaSource)
+    : decodeMediaBase64(mediaSource);
+
+  let type;
+  try {
+    type = await fileTypeFromBuffer(buffer);
+  } catch {
+    throw new MediaError("No se pudo reconocer el formato del archivo", 415);
+  }
+  if (!type || !ALLOWED_MEDIA_TYPES.has(type.mime)) {
+    throw new MediaError("Formato de archivo no permitido", 415);
+  }
+  return { buffer, mimetype: type.mime };
 }
 
 /**
  * Alias para compatibilidad hacia atrás
  */
 async function processImage(imageSource) {
-  return processMedia(imageSource);
+  const media = await processMedia(imageSource);
+  if (!media.buffer || !media.mimetype.startsWith("image/")) {
+    throw new MediaError("La campaña requiere una imagen válida", 415);
+  }
+  return media;
 }
 
 /**
@@ -181,7 +307,7 @@ export async function sendCampaign(req, res) {
     // Función interna para enviar un mensaje individual
     const sendOne = async (msgText, msgImage) => {
       try {
-        if (msgImage) {
+        if (msgImage != null && msgImage !== "") {
           const { buffer, mimetype } = await processImage(msgImage);
           return await whatsappService.sendImage(
             jid,
@@ -235,9 +361,12 @@ export async function sendCampaign(req, res) {
     logger.error("Error al enviar campaña de WhatsApp", {
       error: error.message,
     });
-    res.status(500).json({
+    if (res.headersSent) return;
+    res.status(error instanceof MediaError ? error.status : 500).json({
       success: false,
-      message: "Error al enviar la campaña: " + error.message,
+      message: error instanceof MediaError
+        ? error.message
+        : "Error al enviar la campaña",
     });
   }
 }
@@ -477,7 +606,6 @@ export async function sendMedia(req, res) {
       media,
       caption,
       filename,
-      mimetype: customMimetype,
     } = req.body;
 
     if (!phone || !type || !media) {
@@ -527,7 +655,13 @@ export async function sendMedia(req, res) {
       });
     }
 
-    const finalMimetype = customMimetype || detectedMimetype;
+    const finalMimetype = detectedMimetype;
+    const matchesType = type === "document" || (type === "sticker"
+      ? finalMimetype === "image/webp"
+      : finalMimetype.startsWith(`${type}/`));
+    if (!matchesType) {
+      throw new MediaError("El formato no corresponde al tipo de envío", 415);
+    }
 
     // Enviar según el tipo
     let result;
@@ -544,7 +678,7 @@ export async function sendMedia(req, res) {
         result = await whatsappService.sendAudio(
           jid,
           buffer,
-          finalMimetype || "audio/mpeg; codecs=opus",
+          finalMimetype,
         );
         break;
       case "video":
@@ -552,7 +686,7 @@ export async function sendMedia(req, res) {
           jid,
           buffer,
           caption || "",
-          finalMimetype || "video/mp4",
+          finalMimetype,
         );
         break;
       case "document":
@@ -560,14 +694,14 @@ export async function sendMedia(req, res) {
           jid,
           buffer,
           filename || "archivo",
-          finalMimetype || "application/pdf",
+          finalMimetype,
         );
         break;
       case "sticker":
         result = await whatsappService.sendSticker(
           jid,
           buffer,
-          finalMimetype || "image/webp",
+          finalMimetype,
         );
         break;
     }
@@ -576,9 +710,11 @@ export async function sendMedia(req, res) {
     res.json(result);
   } catch (error) {
     logger.error("Error al enviar media", { error: error.message });
-    res.status(500).json({
+    res.status(error instanceof MediaError ? error.status : 500).json({
       success: false,
-      message: "Error al enviar el archivo: " + error.message,
+      message: error instanceof MediaError
+        ? error.message
+        : "Error al enviar el archivo",
     });
   }
 }

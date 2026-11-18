@@ -17,7 +17,6 @@ const io = new Server(server, {
 });
 
 console.log("SOCKET.IO CORS:", ALLOWED_ORIGINS);
-console.log("SOCKET.IO SERVICIO:", `https://wa.digimedia-marketing.com`);
 
 let activeSocketConnections = 0;
 

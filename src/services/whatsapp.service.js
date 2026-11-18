@@ -595,6 +595,9 @@ class WhatsAppService {
           if (!resolvedPhone) {
             resolvedPhone = await this.resolveLidToPhone(remoteJid);
           }
+        } else if (remoteJid.endsWith("@s.whatsapp.net")) {
+          const phone = jidBase.split(":")[0].replace(/\D/g, "");
+          resolvedPhone = phone || null;
         }
 
         const hasMedia = this.hasMedia(msg.message);

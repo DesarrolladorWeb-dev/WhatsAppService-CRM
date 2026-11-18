@@ -4,11 +4,26 @@ import cors from "cors";
 import http from "http";
 import { Server } from "socket.io";
 import { ALLOWED_ORIGINS, MAX_SOCKET_CONNECTIONS, PORT } from "./src/config/constants.js";
-import { generalLimiter, sendImageLimiter, authLimiter } from "./src/middleware/rateLimiter.js";
+import { generalLimiter, sendMessageLimiter, sendImageLimiter, authLimiter } from "./src/middleware/rateLimiter.js";
 import { requireServiceSecret, verifySocketToken } from "./src/middleware/serviceAuth.js";
 import * as whatsappController from "./src/controllers/whatsapp.controller.js";
 import whatsappService from "./src/services/whatsapp.service.js";
 import logger from "./src/services/logger.service.js";
+
+// Errores no controlados: se registran para que no queden silenciados.
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled promise rejection", {
+    error: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Excepción no capturada", {
+    error: error.message,
+    stack: error.stack,
+  });
+});
 
 const app = express();
 const server = http.createServer(app);
@@ -65,7 +80,7 @@ app.post(
 // ENVÍO GENÉRICO DE MENSAJES (para CRM)
 app.post(
   "/api/whatsapp/send-message",
-  generalLimiter,
+  sendMessageLimiter,
   whatsappController.sendMessage,
 );
 

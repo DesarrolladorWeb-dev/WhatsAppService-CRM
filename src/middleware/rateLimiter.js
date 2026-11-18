@@ -14,6 +14,12 @@ export const authLimiter = rateLimit({
     max: RATE_LIMIT_CONFIG.auth.max,
     message: RATE_LIMIT_CONFIG.auth.message,
     skipSuccessfulRequests: true,
+    // Solo cuentan los intentos no autorizados (401/403) y los errores de
+    // servidor (5xx). Los 2xx y los 4xx de negocio (400, 404, 409, 415...)
+    // no consumen cupo: son respuestas esperadas del CRM, no fuerza bruta.
+    requestWasSuccessful: (_req, res) =>
+        res.statusCode < 400 ||
+        (res.statusCode < 500 && res.statusCode !== 401 && res.statusCode !== 403),
     standardHeaders: true,
     legacyHeaders: false
 });

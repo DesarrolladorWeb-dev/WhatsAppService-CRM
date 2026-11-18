@@ -26,12 +26,24 @@ class WhatsAppService {
     this.initializePromise = null;
     this.qrTimeout = null;
     this.eventEmitter = null;
-    this.webhookUrl = null;
+    // URL del webhook del CRM: se lee del entorno al arrancar para que
+    // sobreviva a reinicios (el endpoint setupWebhook la puede sobrescribir).
+    this.webhookUrl = process.env.CRM_WEBHOOK_URL || null;
     this.receivedMessages = [];
     this.maxStoredMessages = 100;
+    // Estado del reintento automático de conexión (backoff exponencial)
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.reconnectDisabledReason = null;
     // Mapa en memoria para resolver LIDs a números de teléfono reales
     // Se pobla cuando se descubre la relación (ej: al recibir mensajes de números conocidos)
     this.lidToPhoneMap = new Map();
+
+    if (this.webhookUrl) {
+      logger.info("Webhook del CRM cargado desde CRM_WEBHOOK_URL", {
+        url: this.webhookUrl,
+      });
+    }
   }
 
   /**
@@ -77,9 +89,16 @@ class WhatsAppService {
     if (!this.webhookUrl) return;
 
     try {
+      const headers = { "Content-Type": "application/json" };
+
+      // Secreto compartido con n8n: solo se envía si está configurado.
+      if (process.env.WHATSAPP_WEBHOOK_SECRET) {
+        headers["x-n8n-secret"] = process.env.WHATSAPP_WEBHOOK_SECRET;
+      }
+
       await fetch(this.webhookUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(messageData),
       });
     } catch (error) {
@@ -209,6 +228,68 @@ class WhatsAppService {
   }
 
   /**
+   * Programa una reconexión con backoff exponencial.
+   * initialize() siempre va con .catch(), de modo que un fallo al iniciar
+   * se registra y se reintenta en vez de producir un unhandledRejection.
+   */
+  scheduleReconnect(reason = "connection-close") {
+    if (this.reconnectDisabledReason) {
+      logger.warn("Reconexión omitida: está deshabilitada", {
+        reason,
+        disabledReason: this.reconnectDisabledReason,
+      });
+      return;
+    }
+
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempts += 1;
+
+    if (this.reconnectAttempts > WHATSAPP_CONFIG.maxReconnectAttempts) {
+      this.reconnectDisabledReason = "max-attempts";
+      logger.error("Se agotaron los reintentos de conexión con WhatsApp", {
+        attempts: this.reconnectAttempts - 1,
+        reason,
+      });
+      return;
+    }
+
+    const attempt = this.reconnectAttempts;
+    const delayMs = Math.min(
+      WHATSAPP_CONFIG.reconnectBaseDelayMs * 2 ** (attempt - 1),
+      WHATSAPP_CONFIG.reconnectMaxDelayMs,
+    );
+
+    logger.info("Reconectando con WhatsApp", { attempt, delayMs, reason });
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.initialize()
+        .then(() => {
+          logger.info("Reintento de conexión iniciado", { attempt });
+        })
+        .catch((error) => {
+          logger.error("Falló el reintento de conexión con WhatsApp", {
+            attempt,
+            error: error.message,
+          });
+          // Reintento con el siguiente backoff (sin promesas sin manejar).
+          this.scheduleReconnect("initialize-failed");
+        });
+    }, delayMs);
+  }
+
+  /**
+   * Reinicia el estado de reconexión (llamado al conectar o al resetear sesión)
+   */
+  resetReconnectState() {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+    this.reconnectDisabledReason = null;
+  }
+
+  /**
    * Obtiene la version de Baileys, usando cache de 24h para evitar
    * una petición de red en cada initialize() (esto sumaba latencia
    * cada vez que se pedía un QR nuevo o se reconectaba).
@@ -327,14 +408,15 @@ class WhatsAppService {
 
     // Manejar cambios de conexión
     if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect =
         lastDisconnect?.error instanceof Boom
-          ? lastDisconnect.error.output.statusCode !==
-            DisconnectReason.loggedOut
+          ? statusCode !== DisconnectReason.loggedOut
           : true;
 
       logger.warn("Conexión cerrada (esto pasa a veces)", {
         reason: lastDisconnect?.error?.message,
+        statusCode,
         shouldReconnect,
       });
 
@@ -346,10 +428,25 @@ class WhatsAppService {
         qrData: null,
       });
 
+      // 440 = connectionReplaced: otra sesión tomó el control del número.
+      // Reconectar en bucle aquí solo peleará contra esa sesión, así que se
+      // registra y se detiene el reintento hasta un reset manual.
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        this.sock = null;
+        this.reconnectDisabledReason = "connection-replaced";
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        logger.error(
+          "Conexión reemplazada por otra sesión de WhatsApp (440) - se detiene la reconexión automática",
+          { statusCode },
+        );
+        return;
+      }
+
       if (shouldReconnect) {
         logger.info("Reconectando...");
         this.sock = null;
-        setTimeout(() => this.initialize(), 3000);
+        this.scheduleReconnect("connection-close");
       } else {
         logger.info("Sesión cerrada por el usuario - Reiniciando servicio...");
         this.sock = null;
@@ -376,12 +473,13 @@ class WhatsAppService {
           }
         }
 
-        setTimeout(() => this.initialize(), 3000);
+        this.scheduleReconnect("logged-out");
       }
     } else if (connection === "open") {
       logger.info("Cliente de WhatsApp listo");
       this.isReady = true;
       this.currentQR = null;
+      this.resetReconnectState();
       clearTimeout(this.qrTimeout);
 
       this.emitQRUpdate({
@@ -665,14 +763,20 @@ class WhatsAppService {
           resolvedPhone,
         });
 
+        // A los clientes (memoria + Socket.IO) solo se envían metadatos:
+        // el base64 de la multimedia y el rawMessage completo quedan
+        // exclusivamente en el POST al webhook.
+        const clientMessageData = { ...messageData, media: null };
+        delete clientMessageData.rawMessage;
+
         // Almacenar en memoria
-        this.storeReceivedMessage(messageData);
+        this.storeReceivedMessage(clientMessageData);
 
         // Emitir por Socket.IO
-        this.emitIncomingMessage(messageData);
+        this.emitIncomingMessage(clientMessageData);
 
         await Promise.allSettled([
-          // Webhook actual del CRM
+          // Webhook actual del CRM (aquí sí va la multimedia y el rawMessage)
           this.sendToWebhook(messageData),
           // Webhook de n8n
           this.sendToN8n(messageData),
@@ -975,11 +1079,7 @@ class WhatsAppService {
           senderName: "Xiomara",
           channel: "whatsapp",
           status: "sent",
-          timestamp: new Date().toLocaleTimeString("es-PE", {
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: false,
-          }),
+          timestamp: new Date().toISOString(),
         });
       }
 
@@ -1083,6 +1183,10 @@ class WhatsAppService {
       }
 
       this.isInitializing = true;
+
+      // Un reset manual habilita de nuevo la reconexión automática
+      // (por ejemplo tras un 440 o tras agotar los reintentos).
+      this.resetReconnectState();
 
       await this.destroy(); // destruir recursos y cliente existente
 
@@ -1197,6 +1301,8 @@ class WhatsAppService {
     this.currentQR = null;
     this.initializePromise = null;
     clearTimeout(this.qrTimeout);
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
   }
 
   /**

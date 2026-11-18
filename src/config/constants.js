@@ -7,7 +7,7 @@ export const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
     .filter(Boolean)
   : DEFAULT_ORIGINS;
 
-export const MAX_SOCKET_CONNECTIONS = 10;
+export const MAX_SOCKET_CONNECTIONS = 100;
 export const PORT = process.env.PORT || 3001;
 
 export const TRIGGER_N8N_URL = process.env.TRIGGER_N8N_URL;
@@ -33,11 +33,11 @@ export const RATE_LIMIT_CONFIG = {
   },
   sendMessage: {
     windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 20, // 20 peticiones por 15 minutos
+    max: 300, // 300 peticiones por 15 minutos (equipo de varios asesores)
   },
   sendImage: {
     windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 30, // 30 peticiones por 15 minutos
+    max: 300, // 300 peticiones por 15 minutos (equipo de varios asesores)
   },
 };
 
@@ -52,4 +52,8 @@ export const WHATSAPP_CONFIG = {
   baileysVersionCacheMs: 24 * 60 * 60 * 1000,
   logoutTimeoutMs: 5000,
   maxImageSize: 2,
+  // Reconexión con backoff exponencial (3s, 6s, 12s... hasta 60s)
+  reconnectBaseDelayMs: 3000,
+  reconnectMaxDelayMs: 60000,
+  maxReconnectAttempts: 10,
 };

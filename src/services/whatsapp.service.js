@@ -216,6 +216,7 @@ class WhatsAppService {
    * Configura URL del webhook para mensajes entrantes
    */
   setWebhookUrl(url) {
+    if (process.env.CRM_WEBHOOK_URL) return;
     this.webhookUrl = url;
     logger.info("Webhook URL configurada", { url });
   }

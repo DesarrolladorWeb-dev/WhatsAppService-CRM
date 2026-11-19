@@ -28,7 +28,24 @@ class WhatsAppService {
     this.eventEmitter = null;
     // URL del webhook del CRM: se lee del entorno al arrancar para que
     // sobreviva a reinicios (el endpoint setupWebhook la puede sobrescribir).
-    this.webhookUrl = process.env.CRM_WEBHOOK_URL || null;
+    //
+    // En produccion, un CRM_WEBHOOK_URL con localhost es una copia del .env de
+    // desarrollo: apuntaria a un CRM que no existe dentro del contenedor y
+    // perderia toda la multimedia. Se ignora para que el navegador pueda
+    // registrar la URL buena.
+    const envWebhookUrl = (process.env.CRM_WEBHOOK_URL || "").trim();
+    const envWebhookEsLocal =
+      /(^https?:\/\/)(localhost|127\.0\.0\.1)(:|\/|$)/i.test(envWebhookUrl);
+    const ignorarEnvWebhook =
+      Boolean(envWebhookUrl) &&
+      process.env.NODE_ENV === "production" &&
+      envWebhookEsLocal;
+
+    this.webhookUrl = ignorarEnvWebhook ? null : envWebhookUrl || null;
+    this.webhookUrlFromEnv = Boolean(envWebhookUrl) && !ignorarEnvWebhook;
+    // Ultimo resultado del webhook (ok / status HTTP / error). Se expone en
+    // /api/whatsapp/status para diagnosticar por que no llega la multimedia.
+    this.lastWebhookResult = null;
     this.receivedMessages = [];
     this.maxStoredMessages = 100;
     // Estado del reintento automático de conexión (backoff exponencial)
@@ -38,6 +55,13 @@ class WhatsAppService {
     // Mapa en memoria para resolver LIDs a números de teléfono reales
     // Se pobla cuando se descubre la relación (ej: al recibir mensajes de números conocidos)
     this.lidToPhoneMap = new Map();
+
+    if (ignorarEnvWebhook) {
+      logger.error(
+        "CRM_WEBHOOK_URL apunta a localhost en produccion: se ignora y se espera la URL del CRM",
+        { url: envWebhookUrl },
+      );
+    }
 
     if (this.webhookUrl) {
       logger.info("Webhook del CRM cargado desde CRM_WEBHOOK_URL", {
@@ -86,23 +110,80 @@ class WhatsAppService {
    * Envía mensaje entrante a webhook URL configurada
    */
   async sendToWebhook(messageData) {
-    if (!this.webhookUrl) return;
+    if (!this.webhookUrl) {
+      this.lastWebhookResult = {
+        ok: false,
+        error: "Sin URL de webhook configurada",
+        at: new Date().toISOString(),
+      };
+      return;
+    }
 
-    try {
-      const headers = { "Content-Type": "application/json" };
+    const headers = { "Content-Type": "application/json" };
 
-      // Secreto compartido con n8n: solo se envía si está configurado.
-      if (process.env.WHATSAPP_WEBHOOK_SECRET) {
-        headers["x-n8n-secret"] = process.env.WHATSAPP_WEBHOOK_SECRET;
+    // Secreto compartido con n8n: solo se envía si está configurado.
+    if (process.env.WHATSAPP_WEBHOOK_SECRET) {
+      headers["x-n8n-secret"] = process.env.WHATSAPP_WEBHOOK_SECRET;
+    }
+
+    const body = JSON.stringify(messageData);
+    const intentos = 3;
+
+    for (let intento = 1; intento <= intentos; intento++) {
+      try {
+        const response = await fetch(this.webhookUrl, {
+          method: "POST",
+          headers,
+          body,
+          // Sin timeout, un CRM colgado bloquea el lote entero de entrantes y
+          // la multimedia nunca se guarda.
+          signal: AbortSignal.timeout(20000),
+        });
+
+        if (response.ok) {
+          this.lastWebhookResult = {
+            ok: true,
+            status: response.status,
+            at: new Date().toISOString(),
+          };
+          return;
+        }
+
+        // Antes no se revisaba la respuesta: un 401 (secreto distinto) o un 503
+        // (CRM sin WHATSAPP_WEBHOOK_SECRET) se perdian en silencio, el mensaje
+        // quedaba sin mediaUrl y la burbuja salia vacia.
+        const detalle = (await response.text().catch(() => "")).slice(0, 300);
+        this.lastWebhookResult = {
+          ok: false,
+          status: response.status,
+          error: detalle || `HTTP ${response.status}`,
+          at: new Date().toISOString(),
+        };
+        logger.error("El CRM rechazo el webhook", {
+          status: response.status,
+          detalle,
+          intento,
+          messageId: messageData.messageId,
+        });
+
+        // 4xx es definitivo: el mismo secreto no va a cambiar en un reintento.
+        if (response.status < 500) return;
+      } catch (error) {
+        this.lastWebhookResult = {
+          ok: false,
+          error: error.message,
+          at: new Date().toISOString(),
+        };
+        logger.error("Error al enviar webhook", {
+          error: error.message,
+          intento,
+          messageId: messageData.messageId,
+        });
       }
 
-      await fetch(this.webhookUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(messageData),
-      });
-    } catch (error) {
-      logger.error("Error al enviar webhook", { error: error.message });
+      if (intento < intentos) {
+        await new Promise((resolve) => setTimeout(resolve, intento * 1000));
+      }
     }
   }
 
@@ -216,9 +297,23 @@ class WhatsAppService {
    * Configura URL del webhook para mensajes entrantes
    */
   setWebhookUrl(url) {
-    if (process.env.CRM_WEBHOOK_URL) return;
+    // El entorno manda: asi el CRM desplegado no depende de que alguien abra
+    // el navegador. Si difiere de lo que registra el navegador, se deja
+    // constancia para no perder tiempo buscando el motivo.
+    if (this.webhookUrlFromEnv) {
+      if (this.webhookUrl !== url) {
+        logger.warn(
+          "CRM_WEBHOOK_URL tiene prioridad sobre la URL que registro el navegador",
+          { env: this.webhookUrl, navegador: url },
+        );
+      }
+      return;
+    }
+
+    if (this.webhookUrl !== url) {
+      logger.info("Webhook URL configurada", { url });
+    }
     this.webhookUrl = url;
-    logger.info("Webhook URL configurada", { url });
   }
 
   /**
@@ -1351,6 +1446,13 @@ class WhatsAppService {
         : this.currentQR
           ? "qr-ready"
           : "disconnected",
+      // Diagnostico: confirma a donde van los mensajes y como respondio el CRM
+      // la ultima vez. Un 401/503 aqui explica que la multimedia no se guarde.
+      webhook: {
+        url: this.webhookUrl,
+        source: this.webhookUrlFromEnv ? "env" : "navegador",
+        lastResult: this.lastWebhookResult,
+      },
     };
   }
 }

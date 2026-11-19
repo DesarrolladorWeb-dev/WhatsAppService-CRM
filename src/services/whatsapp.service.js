@@ -1307,6 +1307,33 @@ class WhatsAppService {
   }
 
   /**
+   * Cierra el socket sin hacer logout (no desvincula el dispositivo).
+   * Se usa en SIGTERM/SIGINT: evita que Swarm tenga que matar el proceso
+   * y que el socket viejo siga usando auth_info junto al contenedor nuevo.
+   */
+  closeSocket() {
+    if (this.sock) {
+      this.sock.ev.removeAllListeners();
+
+      try {
+        this.sock.end(undefined);
+      } catch (error) {
+        logger.warn("Error al cerrar el socket en shutdown", {
+          error: error.message,
+        });
+      }
+
+      this.sock = null;
+    }
+
+    this.isReady = false;
+    this.initializePromise = null;
+    clearTimeout(this.qrTimeout);
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  /**
    * Obtiene el estado actual
    */
   getStatus() {

@@ -171,6 +171,37 @@ server.on("error", (error) => {
   logger.error("Error en el servidor HTTP", { error: error.message });
 });
 
+// Apagado ordenado: Swarm/Dokploy envía SIGTERM y espera ~10s antes de SIGKILL.
+// Sin listeners propios, Node como PID 1 ignora SIGTERM, el contenedor muere
+// con 137 y el socket viejo convive unos segundos con el nuevo usando el mismo
+// auth_info (Bad MAC / MessageCounterError / 440).
+let isShuttingDown = false;
+
+function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logger.info("Cerrando servicio de WhatsApp", { signal });
+
+  try {
+    // end() cierra la conexión SIN logout: la sesión queda vinculada.
+    whatsappService.closeSocket();
+  } catch (error) {
+    logger.warn("Error al cerrar el socket de WhatsApp al apagar", {
+      error: error.message,
+    });
+  }
+
+  io.close();
+  server.close(() => process.exit(0));
+
+  // Red de seguridad por si queda alguna conexión abierta.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 // Iniciar servidor
 server.listen(PORT, () => {
   logger.info(`Servicio de WhatsApp iniciado en el puerto: ${PORT}`);

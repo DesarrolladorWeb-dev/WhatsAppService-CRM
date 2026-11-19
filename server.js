@@ -37,7 +37,12 @@ let activeSocketConnections = 0;
 
 app.set("trust proxy", 1);
 app.use(cors({ origin: ALLOWED_ORIGINS }));
-app.use(express.json({ limit: "10mb" }));
+// Un documento de 50 MiB ocupa cerca de 67 MiB al codificarse como Base64.
+// Solo la ruta multimedia acepta ese cuerpo; el resto conserva el límite normal.
+app.use((req, res, next) => {
+  const limit = req.path === "/api/whatsapp/send-media" ? "75mb" : "15mb";
+  express.json({ limit })(req, res, next);
+});
 
 io.use((socket, next) =>
   verifySocketToken(socket.handshake.auth?.token)

@@ -1074,7 +1074,7 @@ class WhatsAppService {
   /**
    * Envía un documento/archivo
    */
-  async sendDocument(jid, docBuffer, filename, mimetype = "application/pdf") {
+  async sendDocument(jid, docBuffer, filename, mimetype = "application/pdf", caption = "") {
     if (!this.isReady || !this.sock) {
       throw new Error("WhatsApp no está conectado");
     }
@@ -1084,6 +1084,7 @@ class WhatsAppService {
         document: docBuffer,
         fileName: filename,
         mimetype,
+        caption,
       });
 
       logger.info("Documento enviado", { jid, filename });

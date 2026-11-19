@@ -109,8 +109,8 @@ export async function resetSession(req, res) {
 // Límites por archivo. express.json limita el cuerpo HTTP entrante;
 // estos controles también protegen las descargas remotas y la decodificación.
 const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
 const MEDIA_TIMEOUT_MS = 15_000;
-const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_MEDIA_BYTES / 3);
 const ALLOWED_MEDIA_TYPES = new Set([
   // Imágenes
   "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif",
@@ -126,7 +126,20 @@ const ALLOWED_MEDIA_TYPES = new Set([
   "video/x-msvideo", "video/x-matroska", "video/mpeg",
   // Documento permitido
   "application/pdf",
+  "application/msword",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ]);
+
+const LEGACY_OFFICE_MIMES = {
+  doc: "application/msword",
+  xls: "application/vnd.ms-excel",
+  ppt: "application/vnd.ms-powerpoint",
+};
+const CFBF_SIGNATURE = Buffer.from("d0cf11e0a1b11ae1", "hex");
 
 class MediaError extends Error {
   constructor(message, status = 400) {
@@ -161,7 +174,7 @@ function safeLookup(hostname, options, callback) {
   });
 }
 
-async function downloadMedia(source) {
+async function downloadMedia(source, maxBytes = MAX_MEDIA_BYTES) {
   let url;
   try {
     url = new URL(source);
@@ -199,8 +212,8 @@ async function downloadMedia(source) {
     let size = 0;
     for await (const chunk of response) {
       size += chunk.length;
-      if (size > MAX_MEDIA_BYTES) {
-        throw new MediaError("El archivo supera los 10 MB", 413);
+      if (size > maxBytes) {
+        throw new MediaError(`El archivo supera el límite de ${Math.floor(maxBytes / (1024 * 1024))} MiB`, 413);
       }
       chunks.push(chunk);
     }
@@ -218,15 +231,16 @@ async function downloadMedia(source) {
   }
 }
 
-function decodeMediaBase64(source) {
+function decodeMediaBase64(source, maxBytes = MAX_MEDIA_BYTES) {
   let base64 = source;
   if (/^data:/i.test(source)) {
     const comma = source.indexOf(",");
     if (comma === -1) throw new MediaError("URL de datos inválida");
     base64 = source.slice(comma + 1);
   }
-  if (base64.length > MAX_BASE64_LENGTH || Buffer.byteLength(base64, "base64") > MAX_MEDIA_BYTES) {
-    throw new MediaError("El archivo supera los 10 MB", 413);
+  const maxBase64Length = 4 * Math.ceil(maxBytes / 3);
+  if (base64.length > maxBase64Length || Buffer.byteLength(base64, "base64") > maxBytes) {
+    throw new MediaError(`El archivo supera el límite de ${Math.floor(maxBytes / (1024 * 1024))} MiB`, 413);
   }
   const buffer = Buffer.from(base64, "base64");
   if (!buffer.length) {
@@ -236,7 +250,7 @@ function decodeMediaBase64(source) {
 }
 
 /** Procesa HTTPS o Base64 limitado y devuelve el MIME detectado por los bytes. */
-async function processMedia(mediaSource) {
+async function processMedia(mediaSource, filename, maxBytes = MAX_MEDIA_BYTES) {
   if (mediaSource == null || mediaSource === "") {
     return { buffer: null, mimetype: null };
   }
@@ -245,8 +259,8 @@ async function processMedia(mediaSource) {
   }
 
   const buffer = /^https?:\/\//i.test(mediaSource)
-    ? await downloadMedia(mediaSource)
-    : decodeMediaBase64(mediaSource);
+    ? await downloadMedia(mediaSource, maxBytes)
+    : decodeMediaBase64(mediaSource, maxBytes);
 
   let type;
   try {
@@ -254,10 +268,23 @@ async function processMedia(mediaSource) {
   } catch {
     throw new MediaError("No se pudo reconocer el formato del archivo", 415);
   }
-  if (!type || !ALLOWED_MEDIA_TYPES.has(type.mime)) {
+  // file-type no clasifica los formatos binarios antiguos de Office (.doc/.xls/.ppt).
+  // Aceptarlos solo con la firma CFBF y una extensión de Office conocida.
+  const legacyOfficeExtension = typeof filename === "string"
+    ? filename.split(".").pop()?.toLowerCase()
+    : undefined;
+  const isLegacyOffice =
+    buffer.length >= CFBF_SIGNATURE.length &&
+    buffer.subarray(0, CFBF_SIGNATURE.length).equals(CFBF_SIGNATURE) &&
+    !!legacyOfficeExtension &&
+    Object.hasOwn(LEGACY_OFFICE_MIMES, legacyOfficeExtension);
+  const mimetype = isLegacyOffice
+    ? LEGACY_OFFICE_MIMES[legacyOfficeExtension]
+    : type?.mime;
+  if (!mimetype || !ALLOWED_MEDIA_TYPES.has(mimetype)) {
     throw new MediaError("Formato de archivo no permitido", 415);
   }
-  return { buffer, mimetype: type.mime };
+  return { buffer, mimetype };
 }
 
 /**
@@ -647,7 +674,8 @@ export async function sendMedia(req, res) {
     }
 
     // Procesar el media
-    const { buffer, mimetype: detectedMimetype } = await processMedia(media);
+    const mediaMaxBytes = type === "document" ? MAX_DOCUMENT_BYTES : MAX_MEDIA_BYTES;
+    const { buffer, mimetype: detectedMimetype } = await processMedia(media, filename, mediaMaxBytes);
     if (!buffer) {
       return res.status(400).json({
         success: false,
@@ -695,6 +723,7 @@ export async function sendMedia(req, res) {
           buffer,
           filename || "archivo",
           finalMimetype,
+          caption || "",
         );
         break;
       case "sticker":

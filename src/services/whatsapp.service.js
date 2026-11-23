@@ -578,10 +578,7 @@ class WhatsAppService {
       this.resetReconnectState();
       clearTimeout(this.qrTimeout);
 
-      this.emitQRUpdate({
-        connectionStatus: "connected",
-        qrData: null,
-      });
+      this.emitQRUpdate(this.getStatus());
     }
   }
 
@@ -1432,9 +1429,27 @@ class WhatsAppService {
   /**
    * Obtiene el estado actual
    */
-  getStatus() {
-    return {
-      isConnected: this.isReady,
+ getStatus() {
+  const account = this.isReady ? this.sock?.user : null;
+
+  const accountId = account?.id || "";
+
+  const phoneNumber = /^\d+(?::\d+)?@s\.whatsapp\.net$/.test(accountId)
+    ? accountId.split("@")[0].split(":")[0]
+    : null;
+
+  return {
+    user: account
+      ? {
+          id: phoneNumber
+            ? `${phoneNumber}@s.whatsapp.net`
+            : undefined,
+          phoneNumber,
+          name: account.name || account.verifiedName || null,
+        }
+      : null,
+    phoneNumber,
+    isConnected: this.isReady,
       hasActiveQR: !!this.currentQR,
       qrData: this.currentQR
         ? {
